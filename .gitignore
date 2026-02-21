@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+htmlcov/
+.coverage
+node_modules/
+frontend/dist/
+weights/
+*.pth
+*.pt
+*.onnx
+*.log

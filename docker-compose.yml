@@ -1,0 +1,137 @@
+version: '3.9'
+
+services:
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: integrity_postgres
+    environment:
+      POSTGRES_USER: integrity
+      POSTGRES_PASSWORD: integrity
+      POSTGRES_DB: academic_integrity
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U integrity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: integrity_redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO (S3-compatible storage) ─────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: integrity_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Backend API ───────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: integrity_backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://integrity:integrity@postgres:5432/academic_integrity
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: submissions
+      DEBUG: "true"
+      AI_DETECTION_MOCK: "true"
+      SECRET_KEY: "dev-secret-change-in-production-please"
+      ALLOWED_ORIGINS: '["http://localhost:3000","http://localhost:5173","http://localhost:80","http://frontend"]'
+    volumes:
+      - .:/app
+      - model_weights:/app/weights
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Frontend ──────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: integrity_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # ── MinIO bucket creation (one-shot) ─────────────────────────────────────
+  minio_setup:
+    image: minio/mc:latest
+    container_name: integrity_minio_setup
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/submissions --ignore-existing;
+      mc anonymous set download local/submissions;
+      echo 'MinIO bucket ready';
+      "
+    restart: on-failure
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  model_weights:
+
+  # ── DB Seed (one-shot after postgres is ready) ────────────────────────────
+  seed:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: integrity_seed
+    environment:
+      DATABASE_URL: postgresql+asyncpg://integrity:integrity@postgres:5432/academic_integrity
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      AI_DETECTION_MOCK: "true"
+      SECRET_KEY: "dev-secret-change-in-production-please"
+    command: python scripts/seed.py
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure

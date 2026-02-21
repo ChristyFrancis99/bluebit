@@ -1,0 +1,1 @@
+from modules.ai_detection.detector import AIDetectionModule
