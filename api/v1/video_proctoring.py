@@ -2,6 +2,9 @@ import uuid
 import hashlib
 import os
 import tempfile
+import io
+import cv2
+import numpy as np
 from datetime import datetime
 from typing import Optional, List
 from fastapi import (
@@ -18,6 +21,7 @@ from db.models import VideoProctoringSession
 from db.session import get_db
 from services.auth import get_current_user, TokenData
 from core.config import settings
+from services.video_processor import VideoProcessor
 
 import structlog
 
@@ -518,6 +522,22 @@ class VideoFrameAnalysis(BaseModel):
     reason: Optional[str] = None
 
 
+class MultipleFaceEvent(BaseModel):
+    """Event when multiple faces are detected."""
+    start_time_seconds: float
+    end_time_seconds: float
+    duration_seconds: float
+    max_face_count: int
+    face_count_at_start: int
+
+
+class NoFaceEvent(BaseModel):
+    """Event when no face is detected for a period."""
+    start_time_seconds: float
+    end_time_seconds: float
+    duration_seconds: float
+
+
 class VideoAnalysisResult(BaseModel):
     """Complete analysis result for uploaded video."""
     analysis_id: str
@@ -529,6 +549,10 @@ class VideoAnalysisResult(BaseModel):
     max_faces_in_frame: int
     multiple_faces_frames: int
     no_face_frames: int
+    
+    # Time spans for events
+    multiple_face_events: List[MultipleFaceEvent]
+    no_face_events: List[NoFaceEvent]
     
     # Suspicious frames
     suspicious_frames: List[VideoFrameAnalysis]
@@ -542,44 +566,65 @@ class VideoAnalysisResult(BaseModel):
     analyzed_at: str
 
 
-# Simulated face detection (in production, use ML library like face_recognition or OpenCV)
-async def analyze_video_frame(frame_data: bytes, timestamp: float) -> VideoFrameAnalysis:
+# Initialize global video processor
+_video_processor: Optional[VideoProcessor] = None
+
+
+async def get_video_processor() -> VideoProcessor:
+    """Get or initialize the video processor."""
+    global _video_processor
+    if _video_processor is None:
+        _video_processor = VideoProcessor()
+        await _video_processor.initialize()
+    return _video_processor
+
+
+async def analyze_video_frame(
+    frame_data: bytes, 
+    timestamp: float,
+    processor: VideoProcessor
+) -> VideoFrameAnalysis:
     """
     Analyze a single frame from the video for face detection.
-    In production, this would use a proper face detection library.
-    
-    This is a simulated implementation that detects potential multiple faces
-    based on image analysis patterns.
+    Uses the VideoProcessor with face_recognition library for accurate detection.
     """
-    import random
-    
-    # Simulate face detection results
-    # In production, use: cv2, face_recognition, or MediaPipe
-    face_count = random.choices([0, 1, 2, 3], weights=[5, 70, 20, 5])[0]
-    
-    faces = []
-    for i in range(face_count):
-        faces.append({
-            "face_id": i + 1,
-            "bbox": [random.randint(100, 400), random.randint(100, 300), 100, 100],
-            "confidence": round(random.uniform(0.7, 0.99), 2),
-        })
-    
-    # Determine if suspicious
-    is_suspicious = face_count > 1
-    reason = None
-    if face_count > 1:
-        reason = f"Multiple faces detected: {face_count}"
-    elif face_count == 0:
-        reason = "No face detected in frame"
-    
-    return VideoFrameAnalysis(
-        timestamp_seconds=timestamp,
-        face_count=face_count,
-        faces_detected=faces,
-        is_suspicious=is_suspicious,
-        reason=reason,
-    )
+    try:
+        # Use the VideoProcessor for face detection
+        face_result = await processor.detect_faces(frame_data)
+        
+        # Convert face locations to serializable format
+        faces = []
+        for i, loc in enumerate(face_result.face_locations):
+            faces.append({
+                "face_id": i + 1,
+                "bbox": [loc["top"], loc["right"], loc["bottom"], loc["left"]],
+                "confidence": 0.95,  # face_recognition doesn't provide per-face confidence
+            })
+        
+        # Determine if suspicious
+        is_suspicious = face_result.multiple_faces_detected or face_result.no_face_detected
+        reason = None
+        if face_result.multiple_faces_detected:
+            reason = f"Multiple faces detected: {face_result.face_count}"
+        elif face_result.no_face_detected:
+            reason = "No face detected in frame"
+        
+        return VideoFrameAnalysis(
+            timestamp_seconds=timestamp,
+            face_count=face_result.face_count,
+            faces_detected=faces,
+            is_suspicious=is_suspicious,
+            reason=reason,
+        )
+    except Exception as e:
+        logger.error("frame_analysis.error", error=str(e))
+        return VideoFrameAnalysis(
+            timestamp_seconds=timestamp,
+            face_count=0,
+            faces_detected=[],
+            is_suspicious=False,
+            reason="Analysis error",
+        )
 
 
 @router.post("/analyze-video", response_model=VideoAnalysisResult)
@@ -645,82 +690,288 @@ async def analyze_uploaded_video(
     db.add(session)
     await db.commit()
     
-    # Simulate video analysis
-    # In production, use proper video processing (cv2, ffmpeg)
-    import random
+    # Initialize video processor
+    processor = await get_video_processor()
     
-    # Simulate analyzing ~30 frames (every 2 seconds for a 60-second video)
-    num_frames = 30
-    duration_seconds = random.uniform(30, 180)  # 30 seconds to 3 minutes
+    # Save video to temp file for OpenCV processing
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+        tmp.write(video_bytes)
+        tmp_path = tmp.name
     
-    suspicious_frames = []
-    total_face_detections = 0
-    max_faces = 0
-    multiple_faces_count = 0
-    no_face_count = 0
+    # Track time spans for events
+    multiple_face_events = []
+    no_face_events = []
     
-    for i in range(num_frames):
-        timestamp = (i / num_frames) * duration_seconds
+    # Track consecutive states
+    in_multiple_face_event = False
+    multiple_face_start_time = 0.0
+    max_faces_in_event = 0
+    
+    in_no_face_event = False
+    no_face_start_time = 0.0
+    
+    try:
+        # Open video with OpenCV
+        cap = cv2.VideoCapture(tmp_path)
         
-        # Simulate frame analysis
-        # In production: extract frame using cv2 and detect faces
-        face_count = random.choices([0, 1, 2, 3], weights=[3, 75, 18, 4])[0]
+        if not cap.isOpened():
+            raise HTTPException(400, "Could not open video file")
         
-        total_face_detections += face_count
-        max_faces = max(max_faces, face_count)
+        # Get video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration_seconds = frame_count / fps if fps > 0 else 0
         
-        if face_count > 1:
-            multiple_faces_count += 1
-            suspicious_frames.append(VideoFrameAnalysis(
-                timestamp_seconds=timestamp,
-                face_count=face_count,
-                faces_detected=[
-                    {"face_id": j, "confidence": 0.9} 
-                    for j in range(face_count)
-                ],
-                is_suspicious=True,
-                reason=f"Multiple faces detected: {face_count}",
-            ))
-        elif face_count == 0:
-            no_face_count += 1
-            # Only add some no-face frames as suspicious
-            if random.random() < 0.3:
-                suspicious_frames.append(VideoFrameAnalysis(
-                    timestamp_seconds=timestamp,
-                    face_count=0,
-                    faces_detected=[],
-                    is_suspicious=True,
-                    reason="No face detected for extended period",
-                ))
+        # Calculate frame sampling interval (analyze every Nth frame to keep processing reasonable)
+        # Target ~30 frames for analysis, but adjust based on video length
+        max_frames_to_analyze = 30
+        frame_interval = max(1, frame_count // max_frames_to_analyze)
+        
+        analyzed_frames = 0
+        suspicious_frames = []
+        total_face_detections = 0
+        max_faces = 0
+        multiple_faces_count = 0
+        no_face_count = 0
+        consecutive_no_face = 0
+        
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                # Handle end of video - close any open events
+                if in_multiple_face_event:
+                    end_time = frame_idx / fps if fps > 0 else frame_idx
+                    multiple_face_events.append(MultipleFaceEvent(
+                        start_time_seconds=round(multiple_face_start_time, 2),
+                        end_time_seconds=round(end_time, 2),
+                        duration_seconds=round(end_time - multiple_face_start_time, 2),
+                        max_face_count=max_faces_in_event,
+                        face_count_at_start=0
+                    ))
+                if in_no_face_event:
+                    end_time = frame_idx / fps if fps > 0 else frame_idx
+                    no_face_events.append(NoFaceEvent(
+                        start_time_seconds=round(no_face_start_time, 2),
+                        end_time_seconds=round(end_time, 2),
+                        duration_seconds=round(end_time - no_face_start_time, 2)
+                    ))
+                break
+            
+            # Only analyze every Nth frame
+            if frame_idx % frame_interval == 0:
+                timestamp = frame_idx / fps if fps > 0 else frame_idx
+                
+                # Convert frame to bytes for face detection
+                _, buffer = cv2.imencode('.jpg', frame)
+                frame_bytes = buffer.tobytes()
+                
+                # Analyze frame for faces
+                frame_analysis = await analyze_video_frame(frame_bytes, timestamp, processor)
+                
+                face_count = frame_analysis.face_count
+                total_face_detections += face_count
+                max_faces = max(max_faces, face_count)
+                
+                if face_count > 1:
+                    multiple_faces_count += 1
+                    consecutive_no_face = 0
+                    
+                    # Track multiple face event
+                    if not in_multiple_face_event:
+                        in_multiple_face_event = True
+                        multiple_face_start_time = timestamp
+                        max_faces_in_event = face_count
+                    else:
+                        max_faces_in_event = max(max_faces_in_event, face_count)
+                    
+                    # Close no-face event if open
+                    if in_no_face_event:
+                        no_face_events.append(NoFaceEvent(
+                            start_time_seconds=round(no_face_start_time, 2),
+                            end_time_seconds=round(timestamp, 2),
+                            duration_seconds=round(timestamp - no_face_start_time, 2)
+                        ))
+                        in_no_face_event = False
+                    
+                    suspicious_frames.append(frame_analysis)
+                    
+                elif face_count == 0:
+                    no_face_count += 1
+                    consecutive_no_face += 1
+                    
+                    # Track no-face event
+                    if not in_no_face_event:
+                        in_no_face_event = True
+                        no_face_start_time = timestamp
+                    
+                    # Close multiple face event if open
+                    if in_multiple_face_event:
+                        multiple_face_events.append(MultipleFaceEvent(
+                            start_time_seconds=round(multiple_face_start_time, 2),
+                            end_time_seconds=round(timestamp, 2),
+                            duration_seconds=round(timestamp - multiple_face_start_time, 2),
+                            max_face_count=max_faces_in_event,
+                            face_count_at_start=0
+                        ))
+                        in_multiple_face_event = False
+                    
+                    # Only add some no-face frames as suspicious
+                    if consecutive_no_face >= 3:  # Multiple consecutive frames with no face
+                        suspicious_frames.append(frame_analysis)
+                        
+                else:
+                    consecutive_no_face = 0
+                    
+                    # Close any open events when we have exactly 1 face
+                    if in_multiple_face_event:
+                        multiple_face_events.append(MultipleFaceEvent(
+                            start_time_seconds=round(multiple_face_start_time, 2),
+                            end_time_seconds=round(timestamp, 2),
+                            duration_seconds=round(timestamp - multiple_face_start_time, 2),
+                            max_face_count=max_faces_in_event,
+                            face_count_at_start=0
+                        ))
+                        in_multiple_face_event = False
+                    
+                    if in_no_face_event:
+                        no_face_events.append(NoFaceEvent(
+                            start_time_seconds=round(no_face_start_time, 2),
+                            end_time_seconds=round(timestamp, 2),
+                            duration_seconds=round(timestamp - no_face_start_time, 2)
+                        ))
+                        in_no_face_event = False
+                
+                analyzed_frames += 1
+            
+            frame_idx += 1
+        
+        cap.release()
+        
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
     
-    # Calculate risk score
+    # Calculate risk score based on actual analysis
+    # NEW THRESHOLD SYSTEM:
+    # 1. Absolute absence time (continuous no-face duration)
+    # 2. Ratio of missing faces (based on video length)
+    # 3. Consecutive missing frames
+    
     risk_score = 0.0
     
+    # Check 1: Long absence (absolute time-based)
+    if no_face_events:
+        longest_no_face = max(e.duration_seconds for e in no_face_events) if no_face_events else 0
+        if longest_no_face > 20:
+            risk_score += 0.30  # High risk
+        elif longest_no_face > 10:
+            risk_score += 0.20  # Medium risk
+        elif longest_no_face > 5:
+            risk_score += 0.10  # Warning
+    
+    # Check 2: Ratio of missing faces (based on video length)
+    if analyzed_frames > 0:
+        no_face_ratio = no_face_count / analyzed_frames
+        
+        # Threshold based on video duration
+        if duration_seconds < 120:  # < 2 min
+            ratio_threshold = 0.15
+        elif duration_seconds < 600:  # 2-10 min
+            ratio_threshold = 0.25
+        elif duration_seconds < 3600:  # 10-60 min
+            ratio_threshold = 0.35
+        else:  # > 1 hour
+            ratio_threshold = 0.40
+        
+        if no_face_ratio > ratio_threshold:
+            risk_score += min(no_face_ratio * 0.3, 0.30)
+    
+    # Check 3: Consecutive missing frames
+    if consecutive_no_face > 4:
+        risk_score += 0.15
+    
+    # Multiple faces detected
     if multiple_faces_count > 0:
         risk_score += min(multiple_faces_count / 10.0, 0.40)
     
-    if no_face_count > num_frames * 0.3:  # More than 30% no face
-        risk_score += min(no_face_count / num_frames * 0.3, 0.30)
-    
+    # Maximum faces in a single frame
     if max_faces > 2:
         risk_score += 0.20  # More than 2 faces is highly suspicious
     
     risk_score = min(risk_score, 1.0)
     
-    # Generate flags
+    # Generate industry-style flags (separate from risk score)
     flags = []
-    if multiple_faces_count > 0:
-        flags.append(f"Multiple faces detected in {multiple_faces_count} frames")
-    if no_face_count > num_frames * 0.2:
-        flags.append(f"No face detected in {no_face_count} frames")
-    if max_faces > 2:
-        flags.append(f"Up to {max_faces} faces detected in a single frame")
+    
+    # 1. Video Quality Flags
+    if duration_seconds < 10:
+        flags.append("video_too_short")
+    elif fps and fps < 10:
+        flags.append("low_fps_video")
+    
+    # 2. Face Detection Flags
+    # Multiple faces detected (most critical)
+    if multiple_face_events and multiple_faces_count > 0:
+        flags.append("multiple_faces_detected")
+    # No face detected
+    elif no_face_events and no_face_count > 0:
+        # Check for long absence
+        longest_no_face = max(e.duration_seconds for e in no_face_events) if no_face_events else 0
+        if longest_no_face > 10:
+            flags.append("long_face_absence")
+        elif no_face_count > analyzed_frames * 0.3:
+            flags.append("no_face_detected")
+        else:
+            flags.append("intermittent_face_loss")
+    # No faces at all
+    elif max_faces == 0 and analyzed_frames > 0:
+        flags.append("no_face_detected")
+    # Single face detected (normal case)
+    elif max_faces == 1 and multiple_faces_count == 0 and no_face_count == 0:
+        flags.append("single_face_detected")
+    
+    # 3. Frame Analysis Flags
+    if analyzed_frames > 0:
+        no_face_ratio = no_face_count / analyzed_frames
+        # Check ratio threshold based on video length
+        if duration_seconds < 120:
+            ratio_threshold = 0.15
+        elif duration_seconds < 600:
+            ratio_threshold = 0.25
+        elif duration_seconds < 3600:
+            ratio_threshold = 0.35
+        else:
+            ratio_threshold = 0.40
+        
+        if no_face_ratio > ratio_threshold:
+            flags.append("high_no_face_ratio")
+        
+        # Check for unstable detection (many switches between face/no face)
+        if no_face_count > 0 and multiple_faces_count > 0:
+            flags.append("unstable_detection")
+    
+    # 4. System Behavior Flags
+    flags.append("analysis_complete")
+    
+    # 5. Risk Level Flags (based on final risk score)
+    if risk_score > 0.5:
+        flags.append("high_risk")
+    elif risk_score > 0.2:
+        flags.append("medium_risk")
+    else:
+        flags.append("low_risk")
     
     # Generate recommendation
     if risk_score > 0.6:
         recommendation = "High risk detected. The video shows evidence of multiple people or suspicious behavior. Manual review recommended."
     elif risk_score > 0.3:
         recommendation = "Medium risk detected. Some suspicious patterns detected. Review flagged frames."
+    elif analyzed_frames == 0:
+        recommendation = "Could not analyze video frames. Please ensure the video is valid and contains visible content."
     else:
         recommendation = "Low risk. No significant anomalies detected in the video."
     
@@ -740,12 +991,14 @@ async def analyze_uploaded_video(
     
     result = VideoAnalysisResult(
         analysis_id=analysis_id,
-        total_frames_analyzed=num_frames,
+        total_frames_analyzed=analyzed_frames,
         duration_seconds=round(duration_seconds, 2),
         total_face_detections=total_face_detections,
         max_faces_in_frame=max_faces,
         multiple_faces_frames=multiple_faces_count,
         no_face_frames=no_face_count,
+        multiple_face_events=multiple_face_events[:10],  # Limit to 10 events
+        no_face_events=no_face_events[:10],  # Limit to 10 events
         suspicious_frames=suspicious_frames[:10],  # Limit to 10 most suspicious
         risk_score=round(risk_score, 4),
         flags=flags,
@@ -758,6 +1011,8 @@ async def analyze_uploaded_video(
         analysis_id=analysis_id,
         risk_score=risk_score,
         multiple_faces_count=multiple_faces_count,
+        no_face_count=no_face_count,
+        frames_analyzed=analyzed_frames,
     )
     
     return result
