@@ -109,11 +109,13 @@ from api.v1.auth import router as auth_router
 from api.v1.submissions import router as submissions_router
 from api.v1.modules import router as modules_router
 from api.v1.admin import router as admin_router
+from api.v1.video_proctoring import router as video_proctoring_router
 
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(submissions_router, prefix="/api/v1")
 app.include_router(modules_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
+app.include_router(video_proctoring_router, prefix="/api/v1")
 
 
 # ── WebSocket ────────────────────────────────────────────────────────────────

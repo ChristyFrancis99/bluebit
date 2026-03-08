@@ -120,3 +120,34 @@ class AuditLog(Base):
     details = Column(JSON)
     ip_address = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class VideoProctoringSession(Base):
+    __tablename__ = "video_proctoring_sessions"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    submission_id = Column(String, ForeignKey("submissions.id"), nullable=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    status = Column(String, default="active")  # active, completed, terminated
+    
+    # Face detection metrics
+    face_detected_count = Column(Integer, default=0)
+    face_lost_count = Column(Integer, default=0)
+    multiple_faces_detected_count = Column(Integer, default=0)
+    no_face_duration_seconds = Column(Float, default=0.0)
+    
+    # Environment metrics
+    low_light_count = Column(Integer, default=0)
+    device_change_count = Column(Integer, default=0)
+    screen_capture_detected = Column(Boolean, default=False)
+    
+    # Session timing
+    started_at = Column(DateTime, default=datetime.utcnow)
+    ended_at = Column(DateTime, nullable=True)
+    total_duration_seconds = Column(Float, default=0.0)
+    
+    # Raw events storage
+    events = Column(JSON, default=list)
+    
+    # Risk assessment
+    risk_score = Column(Float, default=0.0)
+    flags = Column(JSON, default=list)
