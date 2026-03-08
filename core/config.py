@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     DEFAULT_WEIGHT_WRITING_PROFILE: float = 0.25
     DEFAULT_WEIGHT_PROCTORING: float = 0.00
 
+    # Video Proctoring
+    VIDEO_PROCTORING_ENABLED: bool = True
+    VIDEO_PROCTORING_REQUIRED: bool = False
+    VIDEO_MAX_DURATION_MINUTES: int = 120
+    VIDEO_FACE_DETECTION_INTERVAL_SECONDS: int = 2
+
     # Risk Thresholds
     RISK_LOW_THRESHOLD: float = 0.35
     RISK_MEDIUM_THRESHOLD: float = 0.65

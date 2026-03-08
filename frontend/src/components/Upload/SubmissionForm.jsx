@@ -4,6 +4,9 @@ import { submissionsApi } from '../../api'
 import { useSubmissionWS } from '../../hooks/useSubmissionWS'
 import { IntegrityScoreGauge } from '../Dashboard/IntegrityScoreGauge'
 import { ModuleResultCard } from '../Dashboard/ModuleResultCard'
+import { VideoRecorder } from '../Proctoring/VideoRecorder'
+import { VideoUploadAnalyzer } from '../Proctoring/VideoUploadAnalyzer'
+import { useVideoProctoring } from '../Proctoring/VideoEvents'
 
 const ACCEPTED = ['.txt', '.docx', '.pdf', '.md']
 const MODULES = [
@@ -22,9 +25,31 @@ export function SubmissionForm({ onComplete }) {
   const [assignmentId, setAssignmentId] = useState('')
   const [modules, setModules]     = useState(['ai_detection', 'plagiarism', 'writing_profile'])
   const [report, setReport]       = useState(null)
+  const [videoProctoringEnabled, setVideoProctoringEnabled] = useState(false)
+  const [videoAnalysisResult, setVideoAnalysisResult] = useState(null)
+  const [proctoringMode, setProctoringMode] = useState('live') // 'live' or 'upload'
   const fileRef = useRef()
 
   const { moduleResults, completed, finalScore, wsStatus, reset } = useSubmissionWS(submissionId)
+  
+  // Video proctoring hook
+  const proctoring = useVideoProctoring(videoProctoringEnabled)
+  
+  // Handle video event from recorder
+  const handleVideoEvent = useCallback((eventType, data = {}) => {
+    proctoring.reportEvent(eventType, data.duration || 0, data.metadata || {})
+  }, [proctoring])
+  
+  // Handle session start
+  const handleSessionStart = useCallback(async () => {
+    const sessionId = await proctoring.startSession(null, assignmentId || null)
+    return sessionId
+  }, [proctoring, assignmentId])
+  
+  // Handle session end
+  const handleSessionEnd = useCallback(async () => {
+    return await proctoring.endSession()
+  }, [proctoring])
 
   const validate = (f) => {
     const ext = '.' + f.name.split('.').pop().toLowerCase()
@@ -43,10 +68,25 @@ export function SubmissionForm({ onComplete }) {
     if (!file || modules.length === 0) return
     setSubmitting(true); setError(null)
     try {
+      // End video proctoring session if active (live mode)
+      let videoSessionId = null
+      if (videoProctoringEnabled && proctoringMode === 'live' && proctoring.sessionId) {
+        await proctoring.endSession()
+        videoSessionId = proctoring.sessionId
+      }
+      
       const fd = new FormData()
       fd.append('file', file)
       if (assignmentId) fd.append('assignment_id', assignmentId)
       fd.append('modules', modules.join(','))
+      if (videoSessionId) fd.append('video_session_id', videoSessionId)
+      
+      // Include video analysis result if in upload mode
+      if (videoProctoringEnabled && proctoringMode === 'upload' && videoAnalysisResult) {
+        fd.append('video_analysis_id', videoAnalysisResult.analysis_id)
+        fd.append('video_risk_score', videoAnalysisResult.risk_score)
+      }
+      
       const res = await submissionsApi.create(fd)
       setSubmissionId(res.submission_id)
     } catch (err) {
@@ -179,6 +219,127 @@ export function SubmissionForm({ onComplete }) {
         <input className="field" value={assignmentId} onChange={e => setAssignmentId(e.target.value)}
           placeholder="e.g. CS101-HW3" />
       </div>
+
+      {/* Video Proctoring Toggle */}
+      <div>
+        <label style={{ fontFamily: 'DM Mono, monospace', fontSize: 10, color: 'var(--slate-text)', letterSpacing: 2, display: 'block', marginBottom: 10 }}>
+          VIDEO PROCTORING <span style={{ opacity: 0.5 }}>(OPTIONAL)</span>
+        </label>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <button
+            type="button"
+            onClick={() => setVideoProctoringEnabled(!videoProctoringEnabled)}
+            style={{
+              position: 'relative',
+              width: 44,
+              height: 24,
+              borderRadius: 12,
+              border: 'none',
+              cursor: 'pointer',
+              background: videoProctoringEnabled ? 'var(--cyan)' : 'rgba(255,255,255,0.1)',
+              transition: 'all 0.2s',
+            }}
+          >
+            <span style={{
+              position: 'absolute',
+              top: 2,
+              left: videoProctoringEnabled ? 22 : 2,
+              width: 20,
+              height: 20,
+              borderRadius: '50%',
+              background: '#fff',
+              transition: 'all 0.2s',
+            }} />
+          </button>
+          <span style={{ 
+            fontFamily: 'DM Mono, monospace', 
+            fontSize: 11, 
+            color: videoProctoringEnabled ? 'var(--cyan)' : 'var(--slate-text)',
+          }}>
+            {videoProctoringEnabled ? 'Enabled' : 'Disabled'}
+          </span>
+        </div>
+      </div>
+
+      {/* Proctoring Mode Toggle */}
+      {videoProctoringEnabled && (
+        <div>
+          <label style={{ fontFamily: 'DM Mono, monospace', fontSize: 10, color: 'var(--slate-text)', letterSpacing: 2, display: 'block', marginBottom: 10 }}>
+            PROCTORING MODE
+          </label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              type="button"
+              onClick={() => setProctoringMode('live')}
+              style={{
+                flex: 1,
+                fontFamily: 'DM Mono, monospace',
+                fontSize: 11,
+                letterSpacing: 1,
+                padding: '8px 12px',
+                borderRadius: 6,
+                cursor: 'pointer',
+                border: `1px solid ${proctoringMode === 'live' ? 'var(--cyan)' : 'var(--border)'}`,
+                background: proctoringMode === 'live' ? 'rgba(0,212,255,0.1)' : 'transparent',
+                color: proctoringMode === 'live' ? 'var(--cyan)' : 'var(--slate-text)',
+                transition: 'all 0.2s',
+              }}
+            >
+              🔴 Live Recording
+            </button>
+            <button
+              type="button"
+              onClick={() => setProctoringMode('upload')}
+              style={{
+                flex: 1,
+                fontFamily: 'DM Mono, monospace',
+                fontSize: 11,
+                letterSpacing: 1,
+                padding: '8px 12px',
+                borderRadius: 6,
+                cursor: 'pointer',
+                border: `1px solid ${proctoringMode === 'upload' ? 'var(--cyan)' : 'var(--border)'}`,
+                background: proctoringMode === 'upload' ? 'rgba(0,212,255,0.1)' : 'transparent',
+                color: proctoringMode === 'upload' ? 'var(--cyan)' : 'var(--slate-text)',
+                transition: 'all 0.2s',
+              }}
+            >
+              📤 Upload Video
+            </button>
+          </div>
+          <div style={{ 
+            fontFamily: 'DM Mono, monospace', 
+            fontSize: 10, 
+            color: 'var(--slate-text)',
+            marginTop: 8,
+            opacity: 0.7,
+          }}>
+            {proctoringMode === 'live' 
+              ? 'Record your session in real-time with face detection'
+              : 'Upload a pre-recorded video to detect multiple faces'
+            }
+          </div>
+        </div>
+      )}
+
+      {/* Video Recorder */}
+      {videoProctoringEnabled && proctoringMode === 'live' && (
+        <VideoRecorder
+          enabled={videoProctoringEnabled}
+          sessionId={proctoring.sessionId}
+          onSessionStart={handleSessionStart}
+          onSessionEnd={handleSessionEnd}
+          onEvent={handleVideoEvent}
+        />
+      )}
+
+      {/* Video Upload Analyzer (for multiple face detection) */}
+      {videoProctoringEnabled && proctoringMode === 'upload' && (
+        <VideoUploadAnalyzer
+          enabled={videoProctoringEnabled}
+          onAnalysisComplete={setVideoAnalysisResult}
+        />
+      )}
 
       {/* Module selector */}
       <div>

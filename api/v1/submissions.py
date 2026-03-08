@@ -12,7 +12,7 @@ from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
-from db.models import Submission, IntegrityReport
+from db.models import Submission, IntegrityReport, VideoProctoringSession
 from db.session import get_db
 from services.auth import get_current_user, TokenData
 from services.extractor import extract_text
@@ -50,6 +50,9 @@ async def create_submission(
     modules: Optional[str] = Form(None),
     assignment_id: Optional[str] = Form(None),
     session_data: Optional[str] = Form(None),
+    video_session_id: Optional[str] = Form(None),
+    video_analysis_id: Optional[str] = Form(None),
+    video_risk_score: Optional[float] = Form(None),
     db: AsyncSession = Depends(get_db),
     current_user: TokenData = Depends(get_current_user),
 ):
@@ -127,13 +130,38 @@ async def create_submission(
         except Exception:
             pass
 
-    # Run analysis in background
+    # Get video proctoring data if provided (live recording mode)
+    video_proctoring_data = {}
+    if video_session_id:
+        from api.v1.video_proctoring import get_session_for_submission
+        video_proctoring_data = await get_session_for_submission(video_session_id, db)
+        if video_proctoring_data:
+            # Update video session with submission ID
+            from sqlalchemy import update
+            await db.execute(
+                update(VideoProctoringSession)
+                .where(VideoProctoringSession.id == video_session_id)
+                .values(submission_id=submission_id)
+            )
+            await db.commit()
+    
+    # Handle video upload analysis (multiple face detection)
+    if video_analysis_id and video_risk_score is not None:
+        if not video_proctoring_data:
+            video_proctoring_data = {}
+        video_proctoring_data["is_active"] = True
+        video_proctoring_data["video_analysis_id"] = video_analysis_id
+        video_proctoring_data["upload_analysis_risk_score"] = video_risk_score
+        video_proctoring_data["multiple_faces_detected"] = video_risk_score > 0.3
+    
+    # Build metadata including video proctoring data
     metadata = {
         "submission_id": submission_id,
         "user_id": current_user.user_id,
         "institution_id": current_user.institution_id,
         "assignment_id": assignment_id,
         "session": session,
+        "video_proctoring": video_proctoring_data,
     }
 
     background_tasks.add_task(

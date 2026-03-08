@@ -46,6 +46,31 @@ export const adminApi = {
   getAuditLog: (limit = 50) => api.get('/admin/audit-log', { params: { limit } }).then(r => r.data),
 }
 
+export const videoProctoringApi = {
+  // Sessions
+  startSession: (data) => api.post('/video-proctoring/sessions', data).then(r => r.data),
+  endSession: (sessionId) => api.delete(`/video-proctoring/sessions/${sessionId}`).then(r => r.data),
+  getSessionStatus: (sessionId) => api.get(`/video-proctoring/sessions/${sessionId}`).then(r => r.data),
+  
+  // Events
+  reportEvent: (sessionId, eventData) => 
+    api.post(`/video-proctoring/sessions/${sessionId}/events`, eventData).then(r => r.data),
+  
+  // Video Upload for Analysis
+  analyzeVideo: (formData) => api.post('/video-proctoring/analyze-video', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  }).then(r => r.data),
+  
+  analyzeVideoUrl: (videoUrl, submissionId = null) => 
+    api.post('/video-proctoring/analyze-video-url', { video_url: videoUrl, submission_id: submissionId }).then(r => r.data),
+  
+  // WebSocket
+  createSessionWS: (sessionId) => {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    return new WebSocket(`${proto}://${location.host}/api/v1/video-proctoring/ws/sessions/${sessionId}`)
+  },
+}
+
 export const createSubmissionWS = (submissionId, onEvent) => {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
   const ws = new WebSocket(`${proto}://${location.host}/ws/submissions/${submissionId}`)
